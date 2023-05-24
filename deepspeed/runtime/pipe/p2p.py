@@ -47,17 +47,17 @@ def _is_valid_send_recv(src_stage, dest_stage):
 
 def send(tensor, dest_stage, async_op=False):
     global _groups
-    assert async_op == False, "Doesn't support async_op true"
+    # assert async_op == False, "Doesn't support async_op true"
     src_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
 
     dest_rank = _grid.stage_to_global(stage_id=dest_stage)
     if async_op:
         global _async
-        op = dist.isend(tensor, dest_rank)
+        assert torch.distributed.is_initialized(), "torch.distributed is required to use async ops."
+        op = torch.distributed.isend(tensor, dest_rank)
         _async.append(op)
     else:
-
         if can_send_recv():
             return dist.send(tensor, dest_rank)
         else:
@@ -68,15 +68,15 @@ def send(tensor, dest_stage, async_op=False):
 
 def recv(tensor, src_stage, async_op=False):
     global _groups
-    assert async_op == False, "Doesn't support async_op true"
+    # assert async_op == False, "Doesn't support async_op true"
     dest_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
-
     src_rank = _grid.stage_to_global(stage_id=src_stage)
 
     if async_op:
         global _async
-        op = dist.irecv(tensor, src_rank)
+        assert torch.distributed.is_initialized(), "torch.distributed is required to use async ops."
+        op = torch.distributed.irecv(tensor, src_rank)
         _async.append(op)
     else:
         if can_send_recv():
@@ -86,15 +86,24 @@ def recv(tensor, src_stage, async_op=False):
             return dist.broadcast(tensor, src_rank, group=group, async_op=async_op)
 
 
-def wait():
+def wait(op_num=None):
+    """Wait from the left of the async. array.
+
+    Args:
+        op_num (int, optional): Number of communication operators in _async to be waited.
+    """
     global _async
-    for op in _async:
-        op.wait()
-    _async = []
-
-    torch.cuda.synchronize()
-
-
+    if op_num is None:
+        for op in _async:
+            op.wait()
+        _async = []
+        torch.cuda.synchronize()
+    else:
+        for i in range(op_num):
+            op = _async.pop(0)
+            op.wait()
+        torch.cuda.synchronize()
+        
 def send_obj(msg: typing.Any, dest: int):
     """Send an arbitrary python object to ``dest``.
 

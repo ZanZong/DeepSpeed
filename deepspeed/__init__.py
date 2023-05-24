@@ -17,6 +17,7 @@ from . import module_inject
 from .runtime.engine import DeepSpeedEngine, DeepSpeedOptimizerCallable, DeepSpeedSchedulerCallable
 from .runtime.engine import ADAM_OPTIMIZER, LAMB_OPTIMIZER
 from .runtime.pipe.engine import PipelineEngine
+from .runtime.pipe.branch_engine import PipelineBranchEngine
 from .inference.engine import InferenceEngine
 from .inference.config import DeepSpeedInferenceConfig
 from .runtime.lr_schedules import add_tuning_arguments
@@ -31,7 +32,7 @@ from .comm.comm import init_distributed
 from .runtime import zero
 from .runtime import DeepSpeedOptimizer, ZeROOptimizer
 
-from .pipe import PipelineModule
+from .pipe import PipelineModule, PipelineBranchModule
 
 from .git_version_info import version, git_hash, git_branch
 
@@ -121,19 +122,19 @@ def initialize(args=None,
 
     assert model is not None, "deepspeed.initialize requires a model"
 
-    if not isinstance(model, PipelineModule):
-        engine = DeepSpeedEngine(args=args,
-                                 model=model,
-                                 optimizer=optimizer,
-                                 model_parameters=model_parameters,
-                                 training_data=training_data,
-                                 lr_scheduler=lr_scheduler,
-                                 mpu=mpu,
-                                 dist_init_required=dist_init_required,
-                                 collate_fn=collate_fn,
-                                 config=config,
-                                 config_params=config_params)
-    else:
+    if isinstance(model, PipelineBranchModule):
+        engine = PipelineBranchEngine(args=args,
+                                model=model,
+                                optimizer=optimizer,
+                                model_parameters=model_parameters,
+                                training_data=training_data,
+                                lr_scheduler=lr_scheduler,
+                                mpu=model.mpu(),
+                                dist_init_required=dist_init_required,
+                                collate_fn=collate_fn,
+                                config=config,
+                                config_params=config_params)
+    elif isinstance(model, PipelineModule):
         assert mpu is None, "mpu must be None with pipeline parallelism"
         engine = PipelineEngine(args=args,
                                 model=model,
@@ -146,6 +147,18 @@ def initialize(args=None,
                                 collate_fn=collate_fn,
                                 config=config,
                                 config_params=config_params)
+    else:
+        engine = DeepSpeedEngine(args=args,
+                                    model=model,
+                                    optimizer=optimizer,
+                                    model_parameters=model_parameters,
+                                    training_data=training_data,
+                                    lr_scheduler=lr_scheduler,
+                                    mpu=mpu,
+                                    dist_init_required=dist_init_required,
+                                    collate_fn=collate_fn,
+                                    config=config,
+                                    config_params=config_params)
 
     return_items = [
         engine,

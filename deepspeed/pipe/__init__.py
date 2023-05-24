@@ -1,1 +1,1 @@
-from ..runtime.pipe import PipelineModule, LayerSpec, TiedLayerSpec
+from ..runtime.pipe import PipelineModule, LayerSpec, TiedLayerSpec, PipelineBranchModule
