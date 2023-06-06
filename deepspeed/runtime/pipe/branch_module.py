@@ -19,6 +19,7 @@ import time
 import networkx as nx
 from collections import defaultdict
 from . import p2p
+from functools import lru_cache
 
 class PipelineError(Exception):
     """Errors related to the use of deepspeed.PipelineModule """
@@ -351,7 +352,7 @@ class PipelineBranchModule(nn.Module):
             if len(self.layer_outputs[layer_id].keys()) == 0:
                 # This layer is loss layer, TODO: a better notation
                 MAX_LAYER_NUM = 1000
-                outstage_outputs[layer_id][MAX_LAYER_NUM] = [tuple([None])]
+                outstage_outputs[layer_id][MAX_LAYER_NUM] = [tuple([None])] # init. as a list for convenient expanding
             else:
                 for succ_layer in sorted(self.layer_outputs[layer_id].keys()):
                     if not self.in_stage(succ_layer):
@@ -367,33 +368,55 @@ class PipelineBranchModule(nn.Module):
         self.output_buffers = outstage_outputs
         self.input_buffers = outstage_inputs
     
+    def query_stage(self, layer_id):
+        num_stages = self._topo.get_dim('pipe')
+        for stage in range(num_stages):
+            start = self.parts[stage]
+            stop = self.parts[stage + 1]
+            if layer_id >= start and layer_id < stop:
+                return stage
+            elif stage == num_stages - 1 and layer_id >= start and layer_id <= stop:
+                return num_stages - 1
+            else:
+                print(f"Cannot index a stage for layer {layer_id}")
+    
     def build_stage_buffer(self):
         self.init_outstage_buffers()
         self.layer_output_buffer = dict()
-        self.local_stage_read_data = []
+        self.stage_read_data_layers = dict()
         # check if local stage needs original input data
-        for layer, preds in self.input_buffers.items():
-            for pred in preds.keys():
-                if pred == -1:
-                    self.local_stage_read_data.append(layer)
-        # normal loss layer
-        if self.stage_id == self.num_stages - 1 and not self.is_constrastive_loss:
-            self.local_stage_read_data.append(self.stage_id)
-        logger.info(f"Local rank={self.local_rank}, input_buffer={self.input_buffers}, output_buffer={self.output_buffers}, read_data_layer={self.local_stage_read_data}")
+        for stage in range(self.num_stages):
+            self.stage_read_data_layers[stage] = list()
+        for layer_id, predecs_layer in self.layer_inputs.items():
+            if len(predecs_layer.keys()) == 0:
+                stage = self.query_stage(layer_id)
+                self.stage_read_data_layers[stage].append(layer_id)
+        
+        print(f"Rank {self.local_rank}: stage_read_data_layers={self.stage_read_data_layers}")
+        # TODO what if normal loss layer 
+        # if not self.is_constrastive_loss:
+        #     self.stage_read_data_layers[self.num_stages - 1].append(self.stage_id)
+        logger.info(f"Local rank={self.local_rank}, input_buffer={self.input_buffers}, output_buffer={self.output_buffers}, read_data_layer={self.stage_read_data_layers}")
     
     def form_layer_input(self, layer_id):
-        # if layer_id == self._local_start:
-        #     inputs = []
-        #     for ingest_layer in sorted(self.input_buffers.keys()):
-        #         for pred_layer in self.input_buffers[ingest_layer].keys():
-        #             if isinstance(self.input_buffers[ingest_layer][pred_layer][self.buffer_id], tuple):
-        #                 print('is tuple')
-        #                 inputs.append([t.clone() for t in self.input_buffers[ingest_layer][pred_layer][self.buffer_id]])
-        #             else:
-        #                 print('is tensor')
-        #             inputs.append(self.input_buffers[ingest_layer][pred_layer][self.buffer_id].clone())
-        # else:
         param_count = sum([len(maps) for _, maps in self.layer_inputs[layer_id].items()])
+        # print(f"Layer {layer_id}: {param_count} parameters are required")
+        # The training input of each branch is not occured in layer_inputs.
+        # Assume each branch only read one element.
+        if param_count == 0:
+            inputs_ = []
+            for ingest_layer in sorted(self.input_buffers.keys()):
+                if ingest_layer != layer_id:
+                    continue
+                for pred_layer in self.input_buffers[ingest_layer].keys():
+                    if isinstance(self.input_buffers[ingest_layer][pred_layer][self.buffer_id], tuple):
+                        inputs_.append([t.clone() for t in self.input_buffers[ingest_layer][pred_layer][self.buffer_id]])
+                    else:
+                        inputs_.append(self.input_buffers[ingest_layer][pred_layer][self.buffer_id].clone())
+            if inputs_[0].grad is not None:
+                inputs_[0].grad.data.zero_()
+            return tuple(inputs_)
+        
         inputs = [None] * param_count
         for predecs_layer in sorted(self.layer_inputs[layer_id].keys()):
             if predecs_layer in self.layer_output_buffer.keys():
@@ -422,9 +445,23 @@ class PipelineBranchModule(nn.Module):
             else:
                 raise ValueError(f"Can't find layer-{layer_id}'s predecessor from layer-{predecs_layer}.")
         input_ready = [t is not None for t in inputs]
-        assert all(input_ready), f"Missing input tensors for layer {layer_id}: {input_ready}."
-        return tuple(inputs) if len(inputs) > 1 else inputs[0]
+        assert all(input_ready), f"Stage {self.stage_id}: Missing input tensors for layer {layer_id}: {input_ready}."
+        return inputs[0] if len(inputs) == 1 else tuple(inputs)
         
+    def sink_layer_output(self, outputs, layer_id):
+        self.layer_output_buffer[layer_id] = outputs
+        # for out_layer, succ_dict in self.module.output_buffers.items():
+        if layer_id in self.output_buffers.keys():
+            for succ in sorted(self.output_buffers[layer_id].keys()):
+                if isinstance(outputs, torch.Tensor):
+                    self.output_buffers[layer_id][succ][self.buffer_id] = outputs
+                else:
+                    outputs_ = []
+                    for (out_, in_) in self.layer_outputs[layer_id][succ]:
+                        outputs_.append(outputs[out_])
+                    self.output_buffers[layer_id][succ][self.buffer_id] = tuple(outputs_)
+
+    
     def set_curr_buffer_id(self, buffer_id):
         self.buffer_id = buffer_id
         
@@ -459,8 +496,13 @@ class PipelineBranchModule(nn.Module):
                         # First layer has been processed
                         inputs = self.form_layer_input(self.curr_layer)
                     # print(f"Layer {self.curr_layer} input is {inputs}")
+                    # if idx == 4:
+                    #     print(f"Layer 4 get input:{inputs}")
                     outputs = layer(inputs)
-                    self.layer_output_buffer[self.curr_layer] = outputs
+                    # if idx == 4:
+                    #     print(f"Layer 4 get output:{outputs}")
+                    # self.layer_output_buffer[self.curr_layer] = outputs
+                    self.sink_layer_output(outputs, self.curr_layer)
                     # print(f"Local Rank {self.local_rank}, layer_output_buffer: {outputs}")
                 return outputs
 
@@ -498,11 +540,13 @@ class PipelineBranchModule(nn.Module):
 
         if self.global_rank == 0:
             logger.info(f'Partitioning pipeline stages with method {method}')
-
-        method = method.lower()
+        if isinstance(method, str):
+            method = method.lower()
 
         # Each stage gets a simple uniform number of layers.
-        if method == 'uniform':
+        if isinstance(method, list):
+            self.parts = method
+        elif method == 'uniform':
             num_layers = len(self._layer_specs)
             self.parts = ds_utils.partition_uniform(num_items=num_layers,
                                                     num_parts=num_stages)

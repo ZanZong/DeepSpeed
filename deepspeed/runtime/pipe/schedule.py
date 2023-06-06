@@ -187,9 +187,9 @@ class TrainAsyncSchedule(PipeSchedule):
     size.
     """
     
-    def __init__(self, micro_batches, stages, stage_id, check_stage_load_inputs):
+    def __init__(self, micro_batches, stages, stage_id, stage_read_data_layers):
         super().__init__(micro_batches, stages, stage_id)
-        self.check_stage_load_inputs = check_stage_load_inputs
+        self.stage_read_data_layers = stage_read_data_layers
 
     def steps(self):
         """"""
@@ -226,7 +226,7 @@ class TrainAsyncSchedule(PipeSchedule):
                     cmds.append(RecvGrad(curr_buffer))
 
             # First/last stage loads
-            if self.check_stage_load_inputs:
+            if len(self.stage_read_data_layers[self.stage]) > 0:
                 if is_forward and self._valid_micro_batch(micro_batch_id):
                     cmds.append(LoadMicroBatch(curr_buffer))
 

@@ -166,6 +166,8 @@ class PipelineBranchEngine(DeepSpeedEngine):
             'output_tensors' : [], # tensor object to preserve backward graph
         }
         self.async_enable = False
+        self.sorted_recv_orders = None
+        self.sorted_send_orders = None
 
         self.pipe_recv_buf = None
         self.grad_layer = None
@@ -271,7 +273,18 @@ class PipelineBranchEngine(DeepSpeedEngine):
         grads = []
         self.buffered_allreduce_fallback(grads=self.optimizer.get_grads_for_reduction(),
                                          elements_per_buffer=MEMORY_OPT_ALLREDUCE_SIZE)
-
+    
+    def _check_if_need_grad(self, tensor):
+        # TODO a better way to identify whether the tensor needs grads
+        if len(tensor.shape) == 2:
+            if tensor.grad_fn is not None:
+                return True
+            else:
+                print(f"No grad_fn or no grad tensor:{tensor}")
+                return False
+        else:
+            return True
+    
     def _reserve_pipe_buffers(self, num_buffers):
         """Ensure that each pipeline buffer has at least ``num_buffers`` slots.
 
@@ -355,9 +368,7 @@ class PipelineBranchEngine(DeepSpeedEngine):
         sched = schedule.TrainAsyncSchedule(micro_batches=self.micro_batches,
                                        stages=self.num_stages,
                                        stage_id=self.stage_id,
-                                       check_stage_load_inputs=True if \
-                                           len(self.module.local_stage_read_data) > 0 else False
-                                       )
+                                       stage_read_data_layers=self.module.stage_read_data_layers)
         self._exec_schedule(sched)
         self.agg_train_loss = self._aggregate_total_loss()
         self.module.init_outstage_buffers() # clear buffers
@@ -378,7 +389,7 @@ class PipelineBranchEngine(DeepSpeedEngine):
                 'pipe_send_output',
                 'pipe_send_grad',
                 'pipe_recv_input',
-                'pipe_recv_input_tensor',
+                # 'pipe_recv_input_tensor',
                 'pipe_recv_grad',
                 'batch_input',
                 'forward',
@@ -663,34 +674,27 @@ class PipelineBranchEngine(DeepSpeedEngine):
 
         return batch
     
-    def get_output_info(self):
-        # TODO: Currently support fully output at once
-        assert len(self.module.output_buffers.keys()) == 1
-        out_layer = list(self.module.output_buffers.keys())[0]
-        assert len(self.module.output_buffers[out_layer].keys()) == 1
-        pred = list(self.module.output_buffers[out_layer].keys())[0]
-        return out_layer, pred
+    # def get_output_info(self):
+    #     # Currently support fully output at once
+    #     assert len(self.module.output_buffers.keys()) == 1
+    #     out_layer = list(self.module.output_buffers.keys())[0]
+    #     assert len(self.module.output_buffers[out_layer].keys()) == 1
+    #     pred = list(self.module.output_buffers[out_layer].keys())[0]
+    #     return out_layer, pred
+    
+    def count_input_num(self, layer_id, predecessor_id):
+        if predecessor_id == -1:
+            # read input data set
+            return 1
+        else:
+            return len(self.module.layer_inputs[layer_id][predecessor_id])
 
     def _exec_forward_pass(self, buffer_id):
         self.tput_timer.start()
         self.mem_status('BEFORE FWD', reset_max=True)
         # Form input with the order of ingest layer's id
         self.module.set_curr_buffer_id(buffer_id)
-        # inputs_ = self.module.form_layer_input(self.module._local_start)
-        inputs_ = []
-        for ingest_layer in sorted(self.module.input_buffers.keys()):
-            if ingest_layer in self.module.local_stage_read_data:    
-                for pred_layer in self.module.input_buffers[ingest_layer].keys():
-                    if isinstance(self.module.input_buffers[ingest_layer][pred_layer][buffer_id], tuple):
-                        inputs_.append([t.clone() for t in self.module.input_buffers[ingest_layer][pred_layer][buffer_id]])
-                    else:
-                        inputs_.append(self.module.input_buffers[ingest_layer][pred_layer][buffer_id].clone())
-        inputs = tuple(inputs_)
-        # logger.info(f"Before exec forward, get input={inputs}")
-        # if isinstance(self.pipe_buffers['inputs'][buffer_id], tuple):
-        #     inputs = [t.clone() for t in self.pipe_buffers['inputs'][buffer_id]]
-        # else:
-        #     inputs = self.pipe_buffers['inputs'][buffer_id].clone()
+        inputs = self.module.form_layer_input(self.module._local_start)
 
         # collect the partitioned input from the previous stage
         if self.is_pipe_partitioned and not self.is_first_stage():
@@ -709,7 +713,7 @@ class PipelineBranchEngine(DeepSpeedEngine):
 
         # Zero out the gradients each time we use the tensor because only the data in
         # tensor changes across batches
-        self._zero_grads(inputs)
+        # self._zero_grads(inputs) # move to form_layer_input()
 
         outputs = super().forward(inputs)
 
@@ -736,10 +740,6 @@ class PipelineBranchEngine(DeepSpeedEngine):
             # Inject the partitioned tensor into the output before sending
             outputs = (part.to_meta(), part.data(), *outputs_tail)
             part = None
-
-        # self.pipe_buffers['outputs'][buffer_id] = outputs
-        out_layer, pred = self.get_output_info()
-        self.module.output_buffers[out_layer][pred][buffer_id] = outputs
 
         # Optionally compute loss on the last device
         if self.is_last_stage():
@@ -778,9 +778,14 @@ class PipelineBranchEngine(DeepSpeedEngine):
             super().backward(self.loss)
             self.mem_status('AFTER BWD')
             return
-
-        out_layer, pred = self.get_output_info()
-        outputs = self.module.output_buffers[out_layer][pred][buffer_id]
+        outputs = []
+        for layer in self.module.output_buffers.keys():
+            for succ in self.module.output_buffers[layer].keys():
+                if isinstance(self.module.output_buffers[layer][succ][buffer_id], torch.Tensor):
+                    outputs.append(self.module.output_buffers[layer][succ][buffer_id])
+                else:
+                    outputs.extend(list(self.module.output_buffers[layer][succ][buffer_id]))
+        outputs = tuple(outputs)
 
         if self.wall_clock_breakdown():
             self.timers('backward_microstep').start()
@@ -816,8 +821,8 @@ class PipelineBranchEngine(DeepSpeedEngine):
             self.optimizer.clear_lp_grads()
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
-            out_tensors = [t for t in outputs if t.is_floating_point()]
-            assert len(out_tensors) == len(grad_tensors)
+            out_tensors = [t for t in outputs if t.is_floating_point() and t.requires_grad]
+            assert len(out_tensors) == len(grad_tensors), f"Out tenosr={len(out_tensors)}, grad tensor={len(grad_tensors)}"
             torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
         else:
             torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
@@ -828,8 +833,9 @@ class PipelineBranchEngine(DeepSpeedEngine):
 
         # Free up the memory from the output of forward()
         self.pipe_buffers['output_tensors'][buffer_id] = None
-        # self.pipe_buffers['outputs'][buffer_id] = None
-        self.module.output_buffers[out_layer][pred][buffer_id] = None
+        for layer in self.module.output_buffers.keys():
+            for succ in self.module.output_buffers[layer].keys():
+                self.module.output_buffers[layer][succ][buffer_id] = None
         grad_tensors = None
         if self.wall_clock_breakdown():
             self.timers('backward_inner').stop()
@@ -842,30 +848,17 @@ class PipelineBranchEngine(DeepSpeedEngine):
     def _exec_load_micro_batch(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers('batch_input').start()
-        t0 = time.time()
         batch = self._next_batch()
-        t1 = time.time()
-        if len(self.module.local_stage_read_data) == 0:
-            print(f"Rank={self.global_rank}, local_stage_read_data is None, but _exec_load_micro_batch is called!")
+        if len(self.module.stage_read_data_layers[self.stage_id]) == 0:
+            print(f"Rank={self.global_rank}, stage {self.stage_id} doesn't need train data, but _exec_load_micro_batch is called!")
             pass
         else:
-            # dummy read single tensor as input
-            if self.module.local_stage_read_data[0] == 0:
-                # local stage is VisionTransformer branch
-                loaded = batch[0].clone().to(self.device).detach()
+            data_start = sum([len(self.module.stage_read_data_layers[s]) for s in range(self.stage_id)])
+            for i, layer_id in enumerate(self.module.stage_read_data_layers[self.stage_id]):
+                cur_data_index = data_start + i
+                loaded = batch[cur_data_index].clone().to(self.device).detach()
                 loaded.requires_grad = loaded.is_floating_point()
-            else:
-                # local stage is TextTransformer branchs
-                loaded = batch[1].clone().to(self.device).detach()
-                loaded.requires_grad = loaded.is_floating_point()
-            requ_input_layer = self.module.local_stage_read_data[0]
-        
-            for pred in self.module.input_buffers[requ_input_layer].keys():
-                if pred == -1:
-                    self.module.input_buffers[requ_input_layer][pred][buffer_id] = loaded
-                    break
-        t2 = time.time()
-        print(f"Local rank={self.global_rank}, t_next_batch={t1 - t0}, t_clone={t2 - t1}")
+                self.module.input_buffers[layer_id][-1][buffer_id] = loaded
         # if self.is_first_stage():
         #     loaded = None
         #     if torch.is_tensor(batch[0]):
@@ -1024,10 +1017,21 @@ class PipelineBranchEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers('pipe_send_output').start()
 
-        # outputs = self.pipe_buffers['outputs'][buffer_id]
-        out_layer, pred = self.get_output_info()
+        if self.sorted_send_orders is None:
+            sorted_send_orders = sorted(self.module.output_buffers.keys())
+            zip_order = zip(sorted_send_orders, [sorted(self.module.output_buffers[i].keys()) for i in sorted_send_orders])
+            self.sorted_send_orders = list(zip_order)
+            print(f"sorted_send_orders:{self.sorted_send_orders}")
+        outputs = []
+        for out_layer, succes in self.sorted_send_orders:
+            for succ in succes:
+                if isinstance(self.module.output_buffers[out_layer][succ][buffer_id], torch.Tensor):
+                    outputs.append(self.module.output_buffers[out_layer][succ][buffer_id])
+                else:
+                    outputs.extend(list(self.module.output_buffers[out_layer][succ][buffer_id]))
         
-        outputs = self.module.output_buffers[out_layer][pred][buffer_id]
+        outputs = tuple(outputs)
+        # print(f"Send activation get {len(outputs)} tensors.")
         # NCCL does not like to send torch.BoolTensor types, so cast the mask to half().
         # We could do char, but with half() we can eventually flatten with other fp16
         # messages (TODO)
@@ -1061,17 +1065,16 @@ class PipelineBranchEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers('pipe_send_grad').start()
         
-        # Assume at most one branch needs send grads
-        grad_back_layer = None
-        grad_back_target = None
-        for layer in self.module.input_buffers.keys():
-            for pred in self.module.input_buffers[layer].keys():
-                if pred == -1: continue
-                grad_back_layer = layer
-                grad_back_target = pred
-        inputs = self.module.input_buffers[grad_back_layer][grad_back_target][buffer_id]          
-        # inputs = self.pipe_buffers['inputs'][buffer_id]
-
+        inputs = []
+        for layer, preds in self.sorted_recv_orders:
+            for pred in preds:
+                read_num = self.count_input_num(layer, pred)
+                if read_num == 1:
+                    inputs.append(self.module.input_buffers[layer][pred][buffer_id])
+                else:
+                    inputs.extend(list(self.module.input_buffers[layer][pred][buffer_id]))
+        inputs = tuple(inputs)
+        
         # Partition the gradient
         if self.is_grad_partitioned:
             if isinstance(inputs, tuple):
@@ -1111,17 +1114,21 @@ class PipelineBranchEngine(DeepSpeedEngine):
                 p2p.send(inputs[0], self.prev_stage)
                 p2p.send(inputs[1], self.prev_stage)
             else:
+                # gard_type_shape = []
                 for idx, buffer in enumerate(inputs):
                     # Skip tensors that will not produce a grad
-                    if not buffer.is_floating_point():
-                        assert buffer.grad is None
+                    if buffer.is_floating_point() and buffer.requires_grad:
+                        p2p.send(buffer.grad, self.prev_stage)
+                        # gard_type_shape.append((list(buffer.size()), buffer.dtype))
+                    else:
+                        # print(f"[Send gards] Tensor in buffer doesn't have grad:{buffer}, {buffer.shape}")
                         continue
-                    assert buffer.grad is not None
-                    p2p.send(buffer.grad, self.prev_stage)
+                # print(f"Rank {self.global_rank} will send grad for {gard_type_shape}")
 
         # We can free up the input buffer now
-        self.module.input_buffers[grad_back_layer][grad_back_target][buffer_id] = None
-        # self.pipe_buffers['inputs'][buffer_id] = None
+        for layer, preds in self.sorted_recv_orders:
+            for pred in preds:
+                self.module.input_buffers[layer][pred][buffer_id] = None
 
         if self.wall_clock_breakdown():
             self.timers('pipe_send_grad').stop()
@@ -1155,7 +1162,6 @@ class PipelineBranchEngine(DeepSpeedEngine):
                                                        dtype=torch.long,
                                                        device=self.device)
                     buffer = self.meta_buffer
-
                 p2p.recv(buffer, self.prev_stage, async_op=self.async_enable)
                 recvd[idx] = buffer.clone().detach()
 
@@ -1166,21 +1172,44 @@ class PipelineBranchEngine(DeepSpeedEngine):
 
             recvd = tuple(recvd)
 
-            for buffer in recvd:
-                buffer.requires_grad = buffer.is_floating_point()
+            for idx, buffer in enumerate(recvd):                
+                buffer.requires_grad = buffer.is_floating_point() and idx < 2 # TODO a better way to identify non-grad tensor
+            # print(f"Recv activation get {len(recvd)}.")
         self.timers('pipe_recv_input_tensor').stop()
         # logger.info(f"DEBUG: recv tensor shape={recvd.shape} from prev stage={self.prev_stage}, tensor={recvd}")
-        # Find proper input recv buffer
-        # Assume at most two input buffers: input data and previous stage
-        recv_layer = None
-        pred_output_layer = None
-        for layer in self.module.input_buffers.keys():
-            for pred in self.module.input_buffers[layer].keys():
-                if pred != -1:
-                    recv_layer = layer
-                    pred_output_layer = pred
-        self.module.input_buffers[recv_layer][pred_output_layer][buffer_id] = recvd
-        # self.pipe_buffers['inputs'][buffer_id] = recvd
+        if isinstance(recvd, torch.Tensor):
+            recv_layer = None
+            pred_output_layer = None
+            for layer in self.module.input_buffers.keys():
+                for pred in self.module.input_buffers[layer].keys():
+                    if pred != -1:
+                        recv_layer = layer
+                        pred_output_layer = pred
+            self.module.input_buffers[recv_layer][pred_output_layer][buffer_id] = recvd
+        else:
+            # tuple may be contain multiple layer's outputs
+            if self.sorted_recv_orders is None:
+                recv_layer_order = sorted(self.module.input_buffers.keys())
+                recv_layer_order = [i for i in recv_layer_order if -1 not in self.module.input_buffers[i].keys()]
+                zip_order = zip(recv_layer_order, [self.module.input_buffers[i].keys() for i in recv_layer_order])
+                sorted_zip_order = sorted(zip_order, key=lambda x: min(x[1]))
+                print(f"sorted_zip_order:{sorted_zip_order}")
+                self.sorted_recv_orders = sorted_zip_order
+            load_pointer = 0
+            for t in self.sorted_recv_orders:
+                for pred in t[1]:
+                    read_num = self.count_input_num(t[0], pred)
+                    if read_num == 1:
+                        self.module.input_buffers[t[0]][pred][buffer_id] = recvd[load_pointer]
+                        load_pointer += 1
+                        # print(f"Put recved {load_pointer}(len=1) to input_buffers[{t[0]}][{pred}]")
+                    else:
+                        t_tuple = []
+                        for i in range(read_num):
+                            t_tuple.append(recvd[load_pointer])
+                            load_pointer += 1
+                        self.module.input_buffers[t[0]][pred][buffer_id] = tuple(t_tuple)
+                        # print(f"Put recved {load_pointer}(len={len(t_tuple)}) to input_buffers[{t[0]}][{pred}]")
 
         if self.wall_clock_breakdown():
             self.timers('pipe_recv_input').stop()
@@ -1188,10 +1217,15 @@ class PipelineBranchEngine(DeepSpeedEngine):
     def _exec_recv_grads(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers('pipe_recv_grad').start()
-
-        # outputs = self.pipe_buffers['outputs'][buffer_id]
-        out_layer, pred = self.get_output_info()
-        outputs = self.module.output_buffers[out_layer][pred][buffer_id]
+        
+        outputs = []
+        for out_layer, succes in self.sorted_send_orders:
+            for succ in succes:
+                if isinstance(self.module.output_buffers[out_layer][succ][buffer_id], torch.Tensor):
+                    outputs.append(self.module.output_buffers[out_layer][succ][buffer_id])
+                else:
+                    outputs.extend(list(self.module.output_buffers[out_layer][succ][buffer_id]))
+        outputs = tuple(outputs)
         
         # XXX these shapes are hardcoded for Megatron
         # Restore partitioned output if it was partitioned and we are sending full gradients
@@ -1236,7 +1270,8 @@ class PipelineBranchEngine(DeepSpeedEngine):
                 else:
                     sizes_and_dtypes = [(list(t.size()),
                                          t.dtype) for t in outputs
-                                        if t.is_floating_point()]
+                                        if t.is_floating_point() and t.requires_grad]
+                    # print(f"Rank {self.global_rank} will recv grad for {sizes_and_dtypes}")
                 self.grad_layer = self._allocate_buffers(sizes_and_dtypes,
                                                          num_buffers=1)[0]
 
@@ -1453,7 +1488,7 @@ class PipelineBranchEngine(DeepSpeedEngine):
         # For each step in the schedule
         for step_cmds in pipe_schedule:
             # For each instruction in the step
-            print(f"\nStep {cout}, global rank {self.global_rank}, exec cmd:{step_cmds}")
+            # print(f"\nStep {cout}, global rank {self.global_rank}, exec cmd:{step_cmds}")
             for cmd in step_cmds:
                 if type(cmd) not in self._INSTRUCTION_MAP:
                     raise RuntimeError(
