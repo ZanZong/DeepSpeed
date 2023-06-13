@@ -165,7 +165,7 @@ class PipelineBranchEngine(DeepSpeedEngine):
             # 'outputs' : [],  # activations
             'output_tensors' : [], # tensor object to preserve backward graph
         }
-        self.async_enable = False
+        self.async_enable = True
         self.sorted_recv_orders = None
         self.sorted_send_orders = None
 
@@ -392,8 +392,10 @@ class PipelineBranchEngine(DeepSpeedEngine):
                 # 'pipe_recv_input_tensor',
                 'pipe_recv_grad',
                 'batch_input',
-                'forward',
-                'backward',
+                'batch_input_iter',
+                'batch_input_place',
+                'forward_microstep',
+                'backward_microstep',
                 # 'backward_inner',
                 'backward_allreduce',
                 'step',
@@ -775,8 +777,12 @@ class PipelineBranchEngine(DeepSpeedEngine):
         # The last stage just runs backward on the loss using DeepSpeed's typical
         # mechanisms.
         if self.is_last_stage():
+            # if self.wall_clock_breakdown():
+            #     self.timers('backward').start()
             super().backward(self.loss)
             self.mem_status('AFTER BWD')
+            # if self.wall_clock_breakdown():
+            #     self.timers('backward').stop()
             return
         outputs = []
         for layer in self.module.output_buffers.keys():
@@ -822,7 +828,7 @@ class PipelineBranchEngine(DeepSpeedEngine):
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
             out_tensors = [t for t in outputs if t.is_floating_point() and t.requires_grad]
-            assert len(out_tensors) == len(grad_tensors), f"Out tenosr={len(out_tensors)}, grad tensor={len(grad_tensors)}"
+            assert len(out_tensors) == len(grad_tensors), f"Out tenosr: {len(out_tensors)} != grad tensor: {len(grad_tensors)}"
             torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
         else:
             torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
@@ -848,7 +854,10 @@ class PipelineBranchEngine(DeepSpeedEngine):
     def _exec_load_micro_batch(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers('batch_input').start()
+            self.timers('batch_input_iter').start()
         batch = self._next_batch()
+        if self.wall_clock_breakdown():
+            self.timers('batch_input_iter').stop()
         if len(self.module.stage_read_data_layers[self.stage_id]) == 0:
             print(f"Rank={self.global_rank}, stage {self.stage_id} doesn't need train data, but _exec_load_micro_batch is called!")
             pass
@@ -1488,7 +1497,7 @@ class PipelineBranchEngine(DeepSpeedEngine):
         # For each step in the schedule
         for step_cmds in pipe_schedule:
             # For each instruction in the step
-            # print(f"\nStep {cout}, global rank {self.global_rank}, exec cmd:{step_cmds}")
+            print(f"\nStep {cout}, global rank {self.global_rank}, exec cmd:{step_cmds}")
             for cmd in step_cmds:
                 if type(cmd) not in self._INSTRUCTION_MAP:
                     raise RuntimeError(

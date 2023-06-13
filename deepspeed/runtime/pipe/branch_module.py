@@ -378,7 +378,7 @@ class PipelineBranchModule(nn.Module):
             elif stage == num_stages - 1 and layer_id >= start and layer_id <= stop:
                 return num_stages - 1
             else:
-                print(f"Cannot index a stage for layer {layer_id}")
+                continue
     
     def build_stage_buffer(self):
         self.init_outstage_buffers()
@@ -391,12 +391,11 @@ class PipelineBranchModule(nn.Module):
             if len(predecs_layer.keys()) == 0:
                 stage = self.query_stage(layer_id)
                 self.stage_read_data_layers[stage].append(layer_id)
-        
-        print(f"Rank {self.local_rank}: stage_read_data_layers={self.stage_read_data_layers}")
         # TODO what if normal loss layer 
         # if not self.is_constrastive_loss:
         #     self.stage_read_data_layers[self.num_stages - 1].append(self.stage_id)
         logger.info(f"Local rank={self.local_rank}, input_buffer={self.input_buffers}, output_buffer={self.output_buffers}, read_data_layer={self.stage_read_data_layers}")
+
     
     def form_layer_input(self, layer_id):
         param_count = sum([len(maps) for _, maps in self.layer_inputs[layer_id].items()])
@@ -538,8 +537,6 @@ class PipelineBranchModule(nn.Module):
         num_stages = self._topo.get_dim('pipe')
         stage_id = self._topo.get_coord(self.global_rank).pipe
 
-        if self.global_rank == 0:
-            logger.info(f'Partitioning pipeline stages with method {method}')
         if isinstance(method, str):
             method = method.lower()
 
@@ -568,6 +565,7 @@ class PipelineBranchModule(nn.Module):
 
         # Print some information on the partitioning.
         if self.global_rank == 0:
+            logger.info(f'Partitioning pipeline stages with method {method}, get partition: {self.parts}')
             for stage in range(num_stages):
                 start = self.parts[stage]
                 stop = self.parts[stage + 1]
