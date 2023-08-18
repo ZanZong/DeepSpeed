@@ -1109,8 +1109,11 @@ class PipelineBranchEngine(DeepSpeedEngine):
             outputs = tuple(outputs)
         if self.wall_clock_breakdown():
             self.timers('pipe_send_output').stop()
+        '''
 
     def _exec_send_grads(self, buffer_id):
+        pass
+        '''
         if self.wall_clock_breakdown():
             self.timers('pipe_send_grad').start()
         
