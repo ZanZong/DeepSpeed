@@ -20,6 +20,7 @@ import networkx as nx
 from collections import defaultdict
 from . import p2p
 from functools import lru_cache
+from .layer_wrapper import IngestLayerWrapper
 
 class PipelineError(Exception):
     """Errors related to the use of deepspeed.PipelineModule """
@@ -89,7 +90,9 @@ class TiedLayerSpec(LayerSpec):
 class StageInput:
     def __init__(self) -> None:
         pass
-
+    
+MAX_LAYER_NUM = 1000 # This layer is loss layer
+MIN_LAYER_NUM = -1 # This layer directly reads data sets, TODO: a better notation
 class PipelineBranchModule(nn.Module):
     """Enabling pipeline parallelism for heavy multi-branch modules.
 
@@ -97,6 +100,7 @@ class PipelineBranchModule(nn.Module):
     def __init__(self,
                  layers,
                  graph_info=None,
+                 see_baseline_perf=False,
                  is_constrastive_loss=False,
                  num_stages=None,
                  topology=None,
@@ -124,6 +128,7 @@ class PipelineBranchModule(nn.Module):
 
         self.seed_layers = seed_layers
         self.graph = graph_info
+        self.see_baseline_perf = see_baseline_perf
         self.is_constrastive_loss = is_constrastive_loss
         self.seed_fn = seed_fn
         self.base_seed = base_seed
@@ -183,6 +188,7 @@ class PipelineBranchModule(nn.Module):
         self._build()
         self.to(f'cuda:{self.local_rank}')
         self.extract_graph_info(self.graph)
+        self.buffer_num = None # pipeline buffer number for micro-batches
         self.build_stage_buffer()
 
         self.tied_comms = self._index_tied_modules()
@@ -194,7 +200,7 @@ class PipelineBranchModule(nn.Module):
         
     def _build(self):
         specs = self._layer_specs
-
+        self.name2local_idx = dict()
         for local_idx, layer in enumerate(specs[self._local_start:self._local_stop]):
             layer_idx = local_idx + self._local_start
             if self.seed_layers:
@@ -206,6 +212,7 @@ class PipelineBranchModule(nn.Module):
             # LayerSpec objects contain an nn.Module that should be allocated now.
             elif isinstance(layer, nn.Module):
                 name = str(layer_idx)
+                self.name2local_idx[name] = local_idx
                 self.forward_funcs.append(layer)
                 self.fwd_map.update({name: len(self.forward_funcs) - 1})
                 self.add_module(name, layer)
@@ -342,31 +349,126 @@ class PipelineBranchModule(nn.Module):
     def in_stage(self, layer_idx):    
             return True if layer_idx >= self._local_start and layer_idx < self._local_stop else False
     
-    def init_outstage_buffers(self):
-        # Branchs to be async send/recv.
-        outstage_outputs = defaultdict(dict) # Needs to be async send
-        outstage_inputs = defaultdict(dict) # Needs to be async receive
+    def get_layer_module(self, layer_idx):
+        return self.get_submodule(str(layer_idx))
+
+    def replace_layer_module(self, layer_idx, new_module):
+        assert hasattr(self, str(layer_idx)), f"To be replaced layer {layer_idx} isn't in module."
+        delattr(self, str(layer_idx))
+        if isinstance(new_module, nn.Module):
+            self.add_module(str(layer_idx), new_module)
+            self.forward_funcs[self.name2local_idx[str(layer_idx)]] = new_module
+
+    def expand_buffers_wrt_sched(self, buffer_num):
+        # expand `num_buffers`` times
+        for cur, preds in self.input_ref.items():
+            for key in preds:
+                self.get_layer_module(cur).input_buffers[key] *= buffer_num
+        for cur, succes in self.output_ref.items():
+            for key in succes:
+                self.get_layer_module(cur).output_buffers[key] *= buffer_num
+    
+    def __guard_layers(self):
+        # Find layers with out-stage connections and guard layers
+        outstage_outputs = defaultdict(list)
+        outstage_inputs = defaultdict(list)
        
         for layer_id in range(self._local_start, self._local_stop):
             # Output pass
             if len(self.layer_outputs[layer_id].keys()) == 0:
-                # This layer is loss layer, TODO: a better notation
-                MAX_LAYER_NUM = 1000
-                outstage_outputs[layer_id][MAX_LAYER_NUM] = [tuple([None])] # init. as a list for convenient expanding
+                outstage_outputs[layer_id].append(MAX_LAYER_NUM)
             else:
                 for succ_layer in sorted(self.layer_outputs[layer_id].keys()):
                     if not self.in_stage(succ_layer):
-                        outstage_outputs[layer_id][succ_layer] = [tuple([None] * len(self.layer_outputs[layer_id][succ_layer]))]
+                        outstage_outputs[layer_id].append(succ_layer)
             # # Input pass
             if len(self.layer_inputs[layer_id].keys()) == 0:
-                # This layer directly reads data sets
-                outstage_inputs[layer_id][-1] = [tuple([None])]
+                outstage_inputs[layer_id].append(MIN_LAYER_NUM) 
             else:
                 for predecs_layer in sorted(self.layer_inputs[layer_id].keys()):
                     if not self.in_stage(predecs_layer):
-                        outstage_inputs[layer_id][predecs_layer] = [tuple([None] * len(self.layer_inputs[layer_id][predecs_layer]))]
-        self.output_buffers = outstage_outputs
-        self.input_buffers = outstage_inputs
+                        outstage_inputs[layer_id].append(predecs_layer)
+        self.output_ref = outstage_outputs
+        self.ordered_output_ref = sorted([key for key in outstage_outputs.keys() if key != MAX_LAYER_NUM])
+        self.input_ref = outstage_inputs
+        
+        # Find an input layer depends on previous stage.
+        # Wrap the layer to handle forward().
+        for layer_id, preds in self.input_ref.items():
+            mod = self.get_layer_module(layer_id)
+            wrapped_mod = IngestLayerWrapper(name=layer_id,
+                                             layer_module=mod,
+                                             preds=preds,
+                                             ports=self.layer_inputs[layer_id])
+            self.replace_layer_module(layer_id, wrapped_mod)
+        print(f"Rank {self.local_rank}, replace module with wrapper: {self.input_ref.keys()}")
+    
+    def __init_layer_buffers(self):
+        """ Because we need to register hooks to some layer modules and 
+            hooks only can access the module registered, we directly preserve 
+            out-stage buffers in layer modules. These buffers can be manipulated by helper functions.
+        """
+        # Output pass
+        for layer_id, succes in self.output_ref.items():
+            layer_mod = self.get_layer_module(layer_id)
+            layer_mod.output_buffers = dict() # {succ0: [buffer0, buffer1], ...}
+            if len(self.layer_outputs[layer_id].keys()) == 0:
+                layer_mod.output_buffers[MAX_LAYER_NUM] = [tuple([None])]
+            else:
+                for succ_layer in sorted(succes):
+                    layer_mod.output_buffers[succ_layer] = [tuple([None] * \
+                                                len(self.layer_outputs[layer_id][succ_layer]))]
+        # Input pass
+        for layer_id, preds in self.input_ref.items():
+            layer_mod = self.get_layer_module(layer_id)
+            layer_mod.input_buffers = dict() # {pred0: [buffer0, buffer1], ...}
+            if len(self.layer_inputs[layer_id].keys()) == 0:
+                layer_mod.input_buffers[MIN_LAYER_NUM] = [tuple([None])]
+            else:
+                for predecs_layer in sorted(preds):
+                    layer_mod.input_buffers[predecs_layer] = [tuple([None] * \
+                                                len(self.layer_inputs[layer_id][predecs_layer]))]
+        
+        
+    def __register_hooks(self):
+        hooked_layers = list()
+        from .register import gen_module_hook_activation_recv, \
+            gen_module_hook_grad_recv_hook, gen_module_hook_activation_send
+        for layer_id in self.input_ref.keys():
+            if MIN_LAYER_NUM in self.input_ref[layer_id]:
+                continue
+            layer_mod = self.get_layer_module(layer_id)
+            for pred_layer in self.input_ref[layer_id]:
+                layer_mod.register_forward_pre_hook(
+                                    gen_module_hook_activation_recv(
+                                        pred_layer,
+                                        self.stage_id - 1, 
+                                        self.local_rank))
+            # Fill some necessary info to this module
+            layer_mod.pipe_recv_buf = None
+            hooked_layers.append(layer_id)
+
+        for layer_id in self.output_ref.keys():
+            if MAX_LAYER_NUM in self.output_ref[layer_id]:
+                continue
+            layer_mod = self.get_layer_module(layer_id)
+            for succ_layer in self.output_ref[layer_id]:
+                layer_mod.register_forward_hook(
+                                        gen_module_hook_activation_send(
+                                            self.local_rank,
+                                            self.stage_id + 1))
+                layer_mod.register_full_backward_pre_hook(
+                                        gen_module_hook_grad_recv_hook(
+                                            succ_layer,
+                                            self.stage_id + 1,
+                                            self.local_rank))
+            layer_mod.grad_layer = None
+            layer_mod.first_output_send = True
+            hooked_layers.append(layer_id)
+            
+        self.hooked_layers = list(set(hooked_layers))
+        print(f"Rank {self.local_rank}, hooked layers:{self.hooked_layers}")
+
     
     def query_stage(self, layer_id):
         num_stages = self._topo.get_dim('pipe')
@@ -381,7 +483,10 @@ class PipelineBranchModule(nn.Module):
                 continue
     
     def build_stage_buffer(self):
-        self.init_outstage_buffers()
+        self.__guard_layers()
+        self.__init_layer_buffers()
+        self.__register_hooks()
+        self.grad_layer_init = False
         self.layer_output_buffer = dict()
         self.stage_read_data_layers = dict()
         # check if local stage needs original input data
@@ -394,75 +499,77 @@ class PipelineBranchModule(nn.Module):
         # TODO what if normal loss layer 
         # if not self.is_constrastive_loss:
         #     self.stage_read_data_layers[self.num_stages - 1].append(self.stage_id)
-        logger.info(f"Local rank={self.local_rank}, input_buffer={self.input_buffers}, output_buffer={self.output_buffers}, read_data_layer={self.stage_read_data_layers}")
+        logger.info(f"Local rank={self.local_rank}, input_buffer={self.input_ref}, output_buffer={self.output_ref}, read_data_layer={self.stage_read_data_layers}")
 
+    def clear_buffers(self):
+        self.__init_layer_buffers()
     
     def form_layer_input(self, layer_id):
         param_count = sum([len(maps) for _, maps in self.layer_inputs[layer_id].items()])
         # print(f"Layer {layer_id}: {param_count} parameters are required")
-        # The training input of each branch is not occured in layer_inputs.
-        # Assume each branch only read one element.
+        # Handle the training input of each branch.
         if param_count == 0:
             inputs_ = []
-            for ingest_layer in sorted(self.input_buffers.keys()):
+            for ingest_layer in sorted(self.input_ref.keys()):
                 if ingest_layer != layer_id:
                     continue
-                for pred_layer in self.input_buffers[ingest_layer].keys():
-                    if isinstance(self.input_buffers[ingest_layer][pred_layer][self.buffer_id], tuple):
-                        inputs_.append([t.clone() for t in self.input_buffers[ingest_layer][pred_layer][self.buffer_id]])
+                for pred_layer in self.input_ref[ingest_layer]:
+                    data = self.get_layer_module(ingest_layer).input_buffers[pred_layer][self.buffer_id]
+                    if isinstance(data, tuple):
+                        inputs_.append([t.clone() for t in data])
                     else:
-                        inputs_.append(self.input_buffers[ingest_layer][pred_layer][self.buffer_id].clone())
-            if inputs_[0].grad is not None:
-                inputs_[0].grad.data.zero_()
-            return tuple(inputs_)
+                        inputs_.append(data.clone())
+            for tensor in inputs_:
+                if tensor.grad is not None:
+                    tensor.grad.data.zero_()
+            return inputs_[0] if len(inputs_) == 1 else tuple(inputs_)
         
         inputs = [None] * param_count
         for predecs_layer in sorted(self.layer_inputs[layer_id].keys()):
+            # Find input within stage
             if predecs_layer in self.layer_output_buffer.keys():
                 for (out_, in_) in self.layer_inputs[layer_id][predecs_layer]:
                     if isinstance(self.layer_output_buffer[predecs_layer], tuple):
                         inputs[in_] = self.layer_output_buffer[predecs_layer][out_] # check, single (x) will also return a tensor
                     else:
                         inputs[in_] = self.layer_output_buffer[predecs_layer]
-            elif predecs_layer in self.input_buffers[layer_id].keys():
-                for (out_, in_) in self.layer_inputs[layer_id][predecs_layer]:
-                    # Current impl. will send all output of the splitted layer to next stage in Tuple(...).
-                    # Only pick referenced tensor here.
-                    if isinstance(self.input_buffers[layer_id][predecs_layer][self.buffer_id], torch.Tensor):
-                        if self.input_buffers[layer_id][predecs_layer][self.buffer_id] is None:
-                            t = time.time()
-                            p2p.wait(1)
-                            dur = time.time() - t
-                            print(f"Rank {self.global_rank} forward wait={dur}")
-                        assert self.input_buffers[layer_id][predecs_layer][self.buffer_id] is not None
-                        inputs[in_] = self.input_buffers[layer_id][predecs_layer][self.buffer_id]
-                    else:
-                        if self.input_buffers[layer_id][predecs_layer][self.buffer_id][out_] is None:
-                            p2p.wait(len(self.input_buffers[layer_id][predecs_layer][self.buffer_id]))
-                        assert self.input_buffers[layer_id][predecs_layer][self.buffer_id][out_] is not None
-                        inputs[in_] = self.input_buffers[layer_id][predecs_layer][self.buffer_id][out_]
+            # Find input tensor through out-stage buffers
+            elif predecs_layer in self.input_ref[layer_id]:
+                # Will be processed in layer wrapper
+                pass
+                # for (out_, in_) in self.layer_inputs[layer_id][predecs_layer]:
+                #     # Current impl. will send all output of the splitted layer to next stage in Tuple(...).
+                #     # Only pick referenced tensor here.
+                #     data = self.get_layer_module(layer_id).input_buffers[predecs_layer][self.buffer_id]
+                #     if isinstance(data, torch.Tensor):
+                #         inputs[in_] = data
+                #     else:
+                #         inputs[in_] = data[out_]
             else:
                 raise ValueError(f"Can't find layer-{layer_id}'s predecessor from layer-{predecs_layer}.")
-        input_ready = [t is not None for t in inputs]
-        assert all(input_ready), f"Stage {self.stage_id}: Missing input tensors for layer {layer_id}: {input_ready}."
+        
         return inputs[0] if len(inputs) == 1 else tuple(inputs)
         
     def sink_layer_output(self, outputs, layer_id):
         self.layer_output_buffer[layer_id] = outputs
         # for out_layer, succ_dict in self.module.output_buffers.items():
-        if layer_id in self.output_buffers.keys():
-            for succ in sorted(self.output_buffers[layer_id].keys()):
+        if layer_id in self.output_ref.keys():
+            for succ in sorted(self.output_ref[layer_id]):
                 if isinstance(outputs, torch.Tensor):
-                    self.output_buffers[layer_id][succ][self.buffer_id] = outputs
+                    self.get_layer_module(layer_id).output_buffers[succ][self.buffer_id] = outputs
                 else:
                     outputs_ = []
                     for (out_, in_) in self.layer_outputs[layer_id][succ]:
                         outputs_.append(outputs[out_])
-                    self.output_buffers[layer_id][succ][self.buffer_id] = tuple(outputs_)
+                    self.get_layer_module(layer_id).output_buffers[succ][self.buffer_id] = tuple(outputs_)
 
-    
     def set_curr_buffer_id(self, buffer_id):
+        """Must be invoked before each scheduled command.
+        """
         self.buffer_id = buffer_id
+        for layer_id in self.hooked_layers:
+            layer_mod = self.get_layer_module(layer_id)
+            layer_mod.buffer_id = buffer_id
         
     def forward(self, forward_input):
         # We need to offset the seed by the microbatch ID. Save it in a local var to
@@ -490,19 +597,10 @@ class PipelineBranchModule(nn.Module):
                             self.seed_fn(new_seed)
                         else:
                             ds_utils.set_random_seed(new_seed)
-                                          
-                    if idx != 0:
-                        # First layer has been processed
-                        inputs = self.form_layer_input(self.curr_layer)
-                    # print(f"Layer {self.curr_layer} input is {inputs}")
-                    # if idx == 4:
-                    #     print(f"Layer 4 get input:{inputs}")
+
+                    inputs = self.form_layer_input(self.curr_layer)
                     outputs = layer(inputs)
-                    # if idx == 4:
-                    #     print(f"Layer 4 get output:{outputs}")
-                    # self.layer_output_buffer[self.curr_layer] = outputs
                     self.sink_layer_output(outputs, self.curr_layer)
-                    # print(f"Local Rank {self.local_rank}, layer_output_buffer: {outputs}")
                 return outputs
 
             return exec_func

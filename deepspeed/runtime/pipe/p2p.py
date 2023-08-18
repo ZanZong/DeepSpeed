@@ -47,7 +47,7 @@ def _is_valid_send_recv(src_stage, dest_stage):
 
 def send(tensor, dest_stage, async_op=False):
     global _groups
-    # assert async_op == False, "Doesn't support async_op true"
+    assert async_op == False, "Doesn't support async_op true"
     src_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
 
@@ -59,7 +59,12 @@ def send(tensor, dest_stage, async_op=False):
         _async.append(op)
     else:
         if can_send_recv():
-            return dist.send(tensor, dest_rank)
+            if not tensor.is_contiguous():
+                print("warning: send tensor not contiguous, converted.")
+                tensor = tensor.contiguous()
+            handle =  dist.send(tensor, dest_rank)
+            # torch.cuda.synchronize()
+            return handle
         else:
             group = _get_send_recv_group(src_stage, dest_stage)
             src_rank = _grid.stage_to_global(stage_id=src_stage)
@@ -68,7 +73,7 @@ def send(tensor, dest_stage, async_op=False):
 
 def recv(tensor, src_stage, async_op=False):
     global _groups
-    # assert async_op == False, "Doesn't support async_op true"
+    assert async_op == False, "Doesn't support async_op true"
     dest_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
     src_rank = _grid.stage_to_global(stage_id=src_stage)
@@ -80,7 +85,10 @@ def recv(tensor, src_stage, async_op=False):
         _async.append(op)
     else:
         if can_send_recv():
-            return dist.recv(tensor, src_rank)
+            handle = dist.recv(tensor, src_rank)
+            # torch.cuda.synchronize()
+            # print(f"[P2P]::recv tensor from {src_rank}: {tensor}")
+            return handle
         else:
             group = _get_send_recv_group(src_stage, dest_stage)
             return dist.broadcast(tensor, src_rank, group=group, async_op=async_op)

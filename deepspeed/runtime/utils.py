@@ -16,7 +16,8 @@ from math import floor
 from bisect import bisect_left
 
 import torch
-from torch._six import inf
+#from torch._six import inf
+from torch import inf
 from deepspeed import comm as dist
 
 from deepspeed.utils import groups, logger
@@ -840,6 +841,13 @@ def see_memory_usage(message, force=False):
     if hasattr(torch.cuda, "reset_peak_memory_stats"):  # pytorch 1.4+
         torch.cuda.reset_peak_memory_stats()
 
+
+# For logging info in multi-woker scenarios.
+log_base_path = "/home/zanzong/workspace/flexpipe/models/swin_transformer/logs/"
+def log_rank2file(info):
+    file_name = str(dist.get_rank()) + '.log'
+    with open(log_base_path + file_name, 'a') as log:
+        log.writelines(str(info))
 
 def call_to_str(base, *args, **kwargs):
     """Construct a string representation of a call.

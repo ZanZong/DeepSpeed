@@ -357,7 +357,7 @@ class PipelineEngine(DeepSpeedEngine):
                 print(f'steps: {self.global_steps} '
                       f'loss: {self.agg_train_loss:0.4f} '
                       f'iter time (s): {iter_time:0.3f} '
-                      f'samples/sec: {tput:0.3f}')
+                      f'samples/sec: {tput:0.3f}, bs={self.train_batch_size()}')
 
         # Monitoring
         if self.global_rank == 0 and self.monitor.enabled:
