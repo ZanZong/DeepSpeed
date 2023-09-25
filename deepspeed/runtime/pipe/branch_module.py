@@ -695,7 +695,7 @@ class PipelineBranchModule(nn.Module):
         self.micro_offset += 1
 
         if self.activation_checkpoint_interval == 0:
-            pass
+            x = forward_input # needs real compute
         else:
             raise ValueError("Activation checkpointing is not supported for now.")            
             num_layers = len(self.forward_funcs)
