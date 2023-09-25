@@ -179,130 +179,6 @@ class InferenceSchedule(PipeSchedule):
         return 2
 
 
-class TrainAsyncSchedule(PipeSchedule):
-    """A schedule for training a batch using hybrid parallelism.
-
-    Pipeline parallelism is extracted through gradient accumulation and thus
-    convergence follows that of a data parallel approach with the same batch
-    size.
-    """
-    
-    def __init__(self, micro_batches, stages, stage_id, stage_read_data_layers):
-        super().__init__(micro_batches, stages, stage_id)
-        self.stage_read_data_layers = stage_read_data_layers
-
-    def steps(self):
-        """"""        
-        if self.see_baseline_perf:
-            """  Use 1F1B schedule as baseline """
-            print("\nUse baseline schedule\n")
-            prev_micro_batch_id = -1
-            total_steps = 2 * (self.micro_batches + self.stages - 1)
-            for step_id in range(total_steps):
-                # Map the step of the pipeline to the micro-batch id and also whether it is a
-                # forward or backward pass step.
-                micro_batch_id, is_forward = self._step_to_micro_batch(step_id)
-
-                if self._valid_micro_batch(prev_micro_batch_id):
-                    prev_buffer = self._buffer_idx(prev_micro_batch_id)
-                if self._valid_micro_batch(micro_batch_id):
-                    curr_buffer = self._buffer_idx(micro_batch_id)
-
-                cmds = []
-
-                # First/last stage loads
-                if len(self.stage_read_data_layers[self.stage]) > 0:
-                    if is_forward and self._valid_micro_batch(micro_batch_id):
-                        cmds.append(LoadMicroBatch(curr_buffer))
-
-                # Computation
-                if self._valid_micro_batch(micro_batch_id):
-                    if is_forward:
-                        cmds.append(ForwardPass(curr_buffer))
-                    else:
-                        cmds.append(BackwardPass(curr_buffer))
-
-                # Model step at the end of the batch
-                if step_id == total_steps - 1:
-                    cmds.append(ReduceTiedGrads())
-                    cmds.append(ReduceGrads())
-                    cmds.append(OptimizerStep())
-
-                # Prepare state for next time
-                prev_micro_batch_id = micro_batch_id
-                yield cmds
-        else:
-            print("\nUse Flexpipe schedule\n")
-            # Flexpipe schedule
-            prev_micro_batch_id = -1
-            # each rank needs process micro_batch times forward+bacward (2*self.micro_batches) and 
-            # warm-up/finish steps (2*(self.stages-1))
-            total_steps = 2 * (self.micro_batches)
-            for step_id in range(total_steps):
-                # Map the step of the pipeline to the micro-batch id and also whether it is a
-                # forward or backward pass step.
-                micro_batch_id, is_forward = self._step_to_micro_batch(step_id)
-
-                if self._valid_micro_batch(prev_micro_batch_id):
-                    prev_buffer = self._buffer_idx(prev_micro_batch_id)
-                if self._valid_micro_batch(micro_batch_id):
-                    curr_buffer = self._buffer_idx(micro_batch_id)
-
-                cmds = []
-                if is_forward:
-                    if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
-                            self.prev_stage):
-                        cmds.append(RecvActivation(curr_buffer))
-                    if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
-                            self.prev_stage):
-                        cmds.append(SendGrad(prev_buffer))
-                else:
-                    if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
-                            self.next_stage):
-                        cmds.append(SendActivation(prev_buffer))
-                    if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
-                            self.next_stage):
-                        cmds.append(RecvGrad(curr_buffer))
-                
-                # First/last stage loads
-                if len(self.stage_read_data_layers[self.stage]) > 0:
-                    if is_forward and self._valid_micro_batch(micro_batch_id):
-                        cmds.append(LoadMicroBatch(curr_buffer))
-
-                # Computation
-                if self._valid_micro_batch(micro_batch_id):
-                    if is_forward:
-                        cmds.append(ForwardPass(curr_buffer))
-                    else:
-                        cmds.append(BackwardPass(curr_buffer))
-
-                # Model step at the end of the batch
-                if step_id == total_steps - 1:
-                    cmds.append(ReduceTiedGrads())
-                    cmds.append(ReduceGrads())
-                    cmds.append(OptimizerStep())
-
-                # Prepare state for next time
-                prev_micro_batch_id = micro_batch_id
-                yield cmds
-                
-                
-    def num_pipe_buffers(self):
-        """As many buffers as the distance from this stage to the last stage.
-        """
-        buffers = min(self.stages - self.stage_id + 1, self.micro_batches)
-        return max(2, buffers)
-
-    def _step_to_micro_batch(self, step_id):
-        if _is_even(step_id):
-            is_forward = True
-            micro_batch_id = int(step_id / 2)
-        elif _is_odd(step_id):
-            is_forward = False
-            micro_batch_id = int((step_id - 1) / 2)
-        return micro_batch_id, is_forward
-
-
 class TrainSchedule(PipeSchedule):
     """A schedule for training a batch using hybrid parallelism.
 
@@ -313,6 +189,8 @@ class TrainSchedule(PipeSchedule):
     def steps(self):
         """"""
         prev_micro_batch_id = -1
+        # each rank needs process micro_batch times forward+bacward (2*self.micro_batches) and 
+        # warm-up/finish steps (2*(self.stages-1))
         total_steps = 2 * (self.micro_batches + self.stages - 1)
         for step_id in range(total_steps):
             # Map the step of the pipeline to the micro-batch id and also whether it is a

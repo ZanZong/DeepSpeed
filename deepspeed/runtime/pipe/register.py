@@ -1,8 +1,14 @@
 import torch.nn as nn
 import torch
-# import torch.distributed as dist # Use deepspeed p2p to share the same group
 from . import p2p
-# import torch.distributed as dist
+
+#### Departed ####
+
+
+DEBUG = False
+def _print(msg):
+    if DEBUG:
+        print(msg)
 
 def _allocate_zeros(shape, device, **kwargs):
     """ Allocate a tensor of zeros on the engine's device.
@@ -170,7 +176,7 @@ def gen_module_hook_activation_send(local_device, dest_stage):
         if module.first_output_send:
             module.first_output_send = False
             _send_tensor_meta(local_device, out, dest_stage)
-        print(f"Call send activation hook!")
+        _print(f"Call send activation hook!")
         if isinstance(out, torch.Tensor):
             if not out.is_contiguous():
                 out = out.contiguous()
@@ -182,13 +188,13 @@ def gen_module_hook_activation_send(local_device, dest_stage):
         else:
             raise NotImplementedError('Could not send output of type '
                                       f'{type(out)}')
-        print(f"Send activation hook FINISH!")
+        _print(f"Send activation hook FINISH!")
     return module_hook_activation_send
 
 def gen_module_hook_grad_recv_hook(succ_layer, source_stage, local_device):
     
     def module_hook_grad_recv_hook(module, inp_grad):
-        # print(f"Call recv grad hook! Get mock in_grad={inp_grad}")
+        # _print(f"Call recv grad hook! Get mock in_grad={inp_grad}")
         # if module.grad_layer is None:
         #     data = module.output_buffers[succ_layer][module.buffer_id]
         #     if isinstance(data, torch.Tensor):
@@ -206,7 +212,7 @@ def gen_module_hook_grad_recv_hook(succ_layer, source_stage, local_device):
         #                                             device=local_device)[0]
         if isinstance(module.grad_layer[succ_layer], torch.Tensor):
             p2p.recv(module.grad_layer[succ_layer], source_stage)
-            # print(f"Recv real grad={module.grad_layer[succ_layer]}")
+            _print(f"Recv real grad={module.grad_layer[succ_layer]}")
         else:
             # output is a tuple, recv grad one-by-one 
             # TODO: (check) is the order right? need a tag to distinguish peers
@@ -218,7 +224,7 @@ def gen_module_hook_grad_recv_hook(succ_layer, source_stage, local_device):
 def gen_module_hook_activation_recv(pred_layer, source_stage, local_device):
     
     def module_hook_activation_recv(module, inp):
-        print("Call recv activation hook!")
+        _print("Call recv activation hook!")
         recvd = None
         # Allocate the buffer if necessary
         if module.pipe_recv_buf is None:
@@ -228,7 +234,7 @@ def gen_module_hook_activation_recv(pred_layer, source_stage, local_device):
             p2p.recv(module.pipe_recv_buf, source_stage)
             recvd = module.pipe_recv_buf.clone().detach()
             recvd.requires_grad = recvd.is_floating_point()
-            print(f"Recv a tensor shape={recvd.shape}")
+            _print(f"Recv a tensor shape={recvd.shape}")
         else:
             assert isinstance(module.pipe_recv_buf, tuple)
             recvd = [None] * len(module.pipe_recv_buf)
@@ -236,7 +242,7 @@ def gen_module_hook_activation_recv(pred_layer, source_stage, local_device):
                 assert torch.is_tensor(buffer)
                 p2p.recv(buffer, source_stage)
                 recvd[idx] = buffer.clone().detach()
-            print(f"Recv a tuple={len(recvd)}")
+            _print(f"Recv a tuple={len(recvd)}")
             recvd = tuple(recvd)
             
             # TODO a better way to identify non-grad tensor, e.g., mask
@@ -257,9 +263,9 @@ def gen_module_hook_activation_recv(pred_layer, source_stage, local_device):
 
 def gen_tensor_hook_grad_send(dest_device):
     def tensor_hook_grad_send(grad):
-        print(f"Call send grad hook! grad={grad.shape}, to device {dest_device}")
+        _print(f"Call send grad hook! grad={grad.shape}, to device {dest_device}")
         if not grad.is_contiguous():
-                print(f"[grad.send] Tensor is not contiguous, convert!")
+                _print(f"[grad.send] Tensor is not contiguous, convert!")
                 grad = grad.contiguous()
         p2p.send(grad, dest_device)
     return tensor_hook_grad_send

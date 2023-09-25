@@ -1,7 +1,15 @@
 import torch
 from torch.nn import Module
 
+#### Departed ####
+
+DEBUG = True
+def _print(msg):
+    if DEBUG:
+        print(msg)
+        
 class IngestLayerWrapper(Module):
+    """ Fill outstage input tensors during forward."""
     def __init__(self, name, layer_module, preds, ports):
         super().__init__()
         self.module_name = name
@@ -11,16 +19,16 @@ class IngestLayerWrapper(Module):
     
     def forward(self, inputs):
         if isinstance(inputs, torch.Tensor):
-            print(f"Ingest Layer wrapper {self.module_name} got a Tensor input! \n\n\n")
+            _print(f"Ingest Layer wrapper {self.module_name} got a Tensor input! \n\n\n")
             return self.mod(inputs)
         elif inputs is None:
-            print(f"Ingest Layer wrapper {self.module_name} got a None input! \n\n\n")
+            _print(f"Ingest Layer wrapper {self.module_name} got a None input!, read layer 0: \n\n\n")
             assert len(self.pred_layers) == 1
             _input = self.input_buffers[self.pred_layers[0]][self.buffer_id]
-            print(_input)
+            _print(_input)
             return self.mod(_input)
         elif isinstance(inputs, tuple):
-            print(f"Ingest Layer wrapper {self.module_name} got a tuple input! \n\n\n")
+            _print(f"Ingest Layer wrapper {self.module_name} got a tuple input! \n\n\n")
             # Tuple of tensors includes [None]
             assert hasattr(self, 'input_buffers')
             _inputs = list(inputs)

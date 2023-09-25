@@ -60,7 +60,7 @@ def send(tensor, dest_stage, async_op=False):
     else:
         if can_send_recv():
             if not tensor.is_contiguous():
-                print("warning: send tensor not contiguous, converted.")
+                # print("warning: send tensor not contiguous, converted.")
                 tensor = tensor.contiguous()
             handle =  dist.send(tensor, dest_rank)
             # torch.cuda.synchronize()
@@ -86,8 +86,6 @@ def recv(tensor, src_stage, async_op=False):
     else:
         if can_send_recv():
             handle = dist.recv(tensor, src_rank)
-            # torch.cuda.synchronize()
-            # print(f"[P2P]::recv tensor from {src_rank}: {tensor}")
             return handle
         else:
             group = _get_send_recv_group(src_stage, dest_stage)

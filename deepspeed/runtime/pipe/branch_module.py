@@ -3,7 +3,7 @@ import glob
 
 import re as regex
 
-from functools import partial
+from functools import partial, lru_cache
 
 import torch
 import torch.nn as nn
@@ -102,6 +102,7 @@ class PipelineBranchModule(nn.Module):
                  graph_info=None,
                  see_baseline_perf=False,
                  is_constrastive_loss=False,
+                 timeline_path=None,
                  num_stages=None,
                  topology=None,
                  loss_fn=None,
@@ -130,6 +131,7 @@ class PipelineBranchModule(nn.Module):
         self.graph = graph_info
         self.see_baseline_perf = see_baseline_perf
         self.is_constrastive_loss = is_constrastive_loss
+        self.timeline_path = timeline_path
         self.seed_fn = seed_fn
         self.base_seed = base_seed
         if dist.get_rank() == 0:
@@ -196,7 +198,9 @@ class PipelineBranchModule(nn.Module):
 
         self.activation_checkpoint_interval = activation_checkpoint_interval
         self.activation_checkpoint_func = activation_checkpoint_func
-
+        
+        ds_utils.see_memory_usage("Memory after build branch module", True)
+        # self.debug_hook_for_backward()
         
     def _build(self):
         specs = self._layer_specs
@@ -359,17 +363,8 @@ class PipelineBranchModule(nn.Module):
             self.add_module(str(layer_idx), new_module)
             self.forward_funcs[self.name2local_idx[str(layer_idx)]] = new_module
 
-    def expand_buffers_wrt_sched(self, buffer_num):
-        # expand `num_buffers`` times
-        for cur, preds in self.input_ref.items():
-            for key in preds:
-                self.get_layer_module(cur).input_buffers[key] *= buffer_num
-        for cur, succes in self.output_ref.items():
-            for key in succes:
-                self.get_layer_module(cur).output_buffers[key] *= buffer_num
-    
-    def __guard_layers(self):
-        # Find layers with out-stage connections and guard layers
+    def __find_outstage(self):
+        # Find layers with out-stage connections
         outstage_outputs = defaultdict(list)
         outstage_inputs = defaultdict(list)
        
@@ -393,42 +388,72 @@ class PipelineBranchModule(nn.Module):
         self.input_ref = outstage_inputs
         
         # Find an input layer depends on previous stage.
-        # Wrap the layer to handle forward().
-        for layer_id, preds in self.input_ref.items():
-            mod = self.get_layer_module(layer_id)
-            wrapped_mod = IngestLayerWrapper(name=layer_id,
-                                             layer_module=mod,
-                                             preds=preds,
-                                             ports=self.layer_inputs[layer_id])
-            self.replace_layer_module(layer_id, wrapped_mod)
-        print(f"Rank {self.local_rank}, replace module with wrapper: {self.input_ref.keys()}")
+        # # Wrap the layer to handle forward().
+        # for layer_id, preds in self.input_ref.items():
+        #     mod = self.get_layer_module(layer_id)
+        #     wrapped_mod = IngestLayerWrapper(name=layer_id,
+        #                                      layer_module=mod,
+        #                                      preds=preds,
+        #                                      ports=self.layer_inputs[layer_id])
+        #     self.replace_layer_module(layer_id, wrapped_mod)
+        # print(f"Rank {self.local_rank}, replace module with wrapper: {self.input_ref.keys()}")
     
     def __init_layer_buffers(self):
-        """ Because we need to register hooks to some layer modules and 
-            hooks only can access the module registered, we directly preserve 
-            out-stage buffers in layer modules. These buffers can be manipulated by helper functions.
+        """ We build output buffers for every layer in self.layer_output_buffer, and
+            out-stage input buffer in layer modules that have out-stage connections.
+            Scheduling algorithm will call expand_buffers_wrt_sched() to lengthen the buffers
+            according to the number of buffers.
         """
         # Output pass
-        for layer_id, succes in self.output_ref.items():
-            layer_mod = self.get_layer_module(layer_id)
-            layer_mod.output_buffers = dict() # {succ0: [buffer0, buffer1], ...}
-            if len(self.layer_outputs[layer_id].keys()) == 0:
-                layer_mod.output_buffers[MAX_LAYER_NUM] = [tuple([None])]
-            else:
-                for succ_layer in sorted(succes):
-                    layer_mod.output_buffers[succ_layer] = [tuple([None] * \
-                                                len(self.layer_outputs[layer_id][succ_layer]))]
-        # Input pass
+        # for layer_id, succes in self.output_ref.items():
+            # layer_mod = self.get_layer_module(layer_id)
+            # layer_mod.output_buffers = dict() # {succ0: [buffer0, buffer1], ...}
+            # if len(self.layer_outputs[layer_id].keys()) == 0:
+            #     layer_mod.output_buffers[MAX_LAYER_NUM] = [tuple([None])]
+            # else:
+            #     for succ_layer in sorted(succes):
+            #         layer_mod.output_buffers[succ_layer] = [tuple([None] * \
+            #                                     len(self.layer_outputs[layer_id][succ_layer]))]
+        # Input buffer
         for layer_id, preds in self.input_ref.items():
             layer_mod = self.get_layer_module(layer_id)
+            if hasattr(layer_mod, "layer_inputs"):
+                del layer_mod.layer_inputs
             layer_mod.input_buffers = dict() # {pred0: [buffer0, buffer1], ...}
             if len(self.layer_inputs[layer_id].keys()) == 0:
-                layer_mod.input_buffers[MIN_LAYER_NUM] = [tuple([None])]
+                layer_mod.input_buffers[MIN_LAYER_NUM] = [None] # TODO: assume a layer only eat single tensor.
             else:
                 for predecs_layer in sorted(preds):
-                    layer_mod.input_buffers[predecs_layer] = [tuple([None] * \
-                                                len(self.layer_inputs[layer_id][predecs_layer]))]
+                    out_num_from_pred = len(self.layer_inputs[layer_id][predecs_layer])
+                    if out_num_from_pred == 1:
+                        layer_mod.input_buffers[predecs_layer] = [None]
+                    else:
+                        layer_mod.input_buffers[predecs_layer] = [tuple([None] * out_num_from_pred)]
         
+        for layer_id, succes in self.output_ref.items():
+            layer_mod = self.get_layer_module(layer_id)
+            if hasattr(layer_mod, "grad_layer"):
+                del layer_mod.grad_layer
+        
+        if hasattr(self, "layer_output_buffer"):
+            del self.layer_output_buffer
+        # For layers do not have out-stage connections, just init None tuple
+        self.layer_output_buffer = dict()
+        for idx in range(self._local_start, self._local_stop):
+            self.layer_output_buffer[idx] = [None]
+        
+    def expand_buffers_wrt_sched(self, buffer_num):
+        """Expand `num_buffers`` times when scheudling."""
+        self.buffer_num = buffer_num
+        
+        for cur, preds in self.input_ref.items():
+            for key in preds:
+                self.get_layer_module(cur).input_buffers[key] *= buffer_num
+            # print(f"Layer {cur} expand buffer, {self.get_layer_module(cur).input_buffers}")
+        
+        # form output as a dict for easy to empty
+        for idx in range(self._local_start, self._local_stop):
+            self.layer_output_buffer[idx] = {i: None for i in range(buffer_num)}
         
     def __register_hooks(self):
         hooked_layers = list()
@@ -438,21 +463,26 @@ class PipelineBranchModule(nn.Module):
             if MIN_LAYER_NUM in self.input_ref[layer_id]:
                 continue
             layer_mod = self.get_layer_module(layer_id)
+            '''
             for pred_layer in self.input_ref[layer_id]:
+                # if pred_layer != MIN_LAYER_NUM:
                 layer_mod.register_forward_pre_hook(
                                     gen_module_hook_activation_recv(
                                         pred_layer,
                                         self.stage_id - 1, 
                                         self.local_rank))
+            '''
             # Fill some necessary info to this module
-            layer_mod.pipe_recv_buf = None
+            # layer_mod.pipe_recv_buf = None
             hooked_layers.append(layer_id)
 
         for layer_id in self.output_ref.keys():
             if MAX_LAYER_NUM in self.output_ref[layer_id]:
                 continue
             layer_mod = self.get_layer_module(layer_id)
+            '''
             for succ_layer in self.output_ref[layer_id]:
+                # if succ_layer != MAX_LAYER_NUM:
                 layer_mod.register_forward_hook(
                                         gen_module_hook_activation_send(
                                             self.local_rank,
@@ -462,14 +492,14 @@ class PipelineBranchModule(nn.Module):
                                             succ_layer,
                                             self.stage_id + 1,
                                             self.local_rank))
-            layer_mod.grad_layer = None
-            layer_mod.first_output_send = True
+            '''
+            # layer_mod.grad_layer = None
             hooked_layers.append(layer_id)
             
         self.hooked_layers = list(set(hooked_layers))
         print(f"Rank {self.local_rank}, hooked layers:{self.hooked_layers}")
 
-    
+    @lru_cache(maxsize=512)
     def query_stage(self, layer_id):
         num_stages = self._topo.get_dim('pipe')
         for stage in range(num_stages):
@@ -481,13 +511,27 @@ class PipelineBranchModule(nn.Module):
                 return num_stages - 1
             else:
                 continue
+            
+    @lru_cache(maxsize=512)
+    def query_output_successors(self, layer_id):
+        """Get successor infomation. 
+        Args:
+            layer_id (_type_): which layer to query.
+        Returns:
+            out_tensor_to_layer: {out_tensor_id: (successor_layer_id, input_index)}
+        """
+        out_tensor_to_layer = {}
+        for succ in sorted(self.layer_outputs[layer_id].keys()):
+            for out_, in_ in self.layer_outputs[layer_id][succ]:
+                if out_ in out_tensor_to_layer.keys():
+                    print("[WARN] Need support: repeat access of a tensor for multiple successors.")
+                out_tensor_to_layer[out_] = (succ, in_)
+        return out_tensor_to_layer
     
     def build_stage_buffer(self):
-        self.__guard_layers()
+        self.__find_outstage()
         self.__init_layer_buffers()
-        self.__register_hooks()
-        self.grad_layer_init = False
-        self.layer_output_buffer = dict()
+        # self.__register_hooks()
         self.stage_read_data_layers = dict()
         # check if local stage needs original input data
         for stage in range(self.num_stages):
@@ -496,15 +540,22 @@ class PipelineBranchModule(nn.Module):
             if len(predecs_layer.keys()) == 0:
                 stage = self.query_stage(layer_id)
                 self.stage_read_data_layers[stage].append(layer_id)
-        # TODO what if normal loss layer 
+        # TODO what if normal loss layer
         # if not self.is_constrastive_loss:
         #     self.stage_read_data_layers[self.num_stages - 1].append(self.stage_id)
-        logger.info(f"Local rank={self.local_rank}, input_buffer={self.input_ref}, output_buffer={self.output_ref}, read_data_layer={self.stage_read_data_layers}")
+        logger.info(f"Local rank={self.local_rank}, input_={self.input_ref}, output_={self.output_ref}, read_data_layer={self.stage_read_data_layers}")
 
-    def clear_buffers(self):
+    def rebuild_buffers(self):
         self.__init_layer_buffers()
+
+    def debug_hook_for_backward(self):
+        def backward_hook(module, res, grad_out):
+            ds_utils.see_memory_usage(f"Call backward layers={module._get_name()}", True)
+            
+        for name, module in self.named_children():
+            module.register_full_backward_hook(backward_hook)
     
-    def form_layer_input(self, layer_id):
+    def form_layer_input(self, layer_id, buffer_id, check_graph_tail=False):    
         param_count = sum([len(maps) for _, maps in self.layer_inputs[layer_id].items()])
         # print(f"Layer {layer_id}: {param_count} parameters are required")
         # Handle the training input of each branch.
@@ -514,11 +565,11 @@ class PipelineBranchModule(nn.Module):
                 if ingest_layer != layer_id:
                     continue
                 for pred_layer in self.input_ref[ingest_layer]:
-                    data = self.get_layer_module(ingest_layer).input_buffers[pred_layer][self.buffer_id]
+                    data = self.get_layer_module(ingest_layer).input_buffers[pred_layer][buffer_id]
                     if isinstance(data, tuple):
-                        inputs_.append([t.clone() for t in data])
+                        inputs_.append([t for t in data])
                     else:
-                        inputs_.append(data.clone())
+                        inputs_.append(data)
             for tensor in inputs_:
                 if tensor.grad is not None:
                     tensor.grad.data.zero_()
@@ -528,86 +579,123 @@ class PipelineBranchModule(nn.Module):
         for predecs_layer in sorted(self.layer_inputs[layer_id].keys()):
             # Find input within stage
             if predecs_layer in self.layer_output_buffer.keys():
+                pred_mod = self.get_layer_module(predecs_layer)
+                # print(f"find pred {predecs_layer} in layer_output_buffer, for buffer id {buffer_id}")
                 for (out_, in_) in self.layer_inputs[layer_id][predecs_layer]:
-                    if isinstance(self.layer_output_buffer[predecs_layer], tuple):
-                        inputs[in_] = self.layer_output_buffer[predecs_layer][out_] # check, single (x) will also return a tensor
+                    if check_graph_tail and hasattr(pred_mod, 'tail_outputs'):
+                        # print(f"{in_}^th tensor out from {predecs_layer}'s tail_outputs")
+                        if isinstance(pred_mod.tail_outputs[buffer_id], torch.Tensor):
+                            inputs[in_] = pred_mod.tail_outputs[buffer_id]
+                        else:
+                            inputs[in_] = pred_mod.tail_outputs[buffer_id][out_]
                     else:
-                        inputs[in_] = self.layer_output_buffer[predecs_layer]
+                        # print(f"{in_}^th tensor out from {predecs_layer}'s layer_output_buffer")
+                        if isinstance(self.layer_output_buffer[predecs_layer][buffer_id], torch.Tensor):
+                            inputs[in_] = self.layer_output_buffer[predecs_layer][buffer_id]
+                        else:  
+                            inputs[in_] = self.layer_output_buffer[predecs_layer][buffer_id][out_]
+            
             # Find input tensor through out-stage buffers
-            elif predecs_layer in self.input_ref[layer_id]:
-                # Will be processed in layer wrapper
-                pass
-                # for (out_, in_) in self.layer_inputs[layer_id][predecs_layer]:
-                #     # Current impl. will send all output of the splitted layer to next stage in Tuple(...).
-                #     # Only pick referenced tensor here.
-                #     data = self.get_layer_module(layer_id).input_buffers[predecs_layer][self.buffer_id]
-                #     if isinstance(data, torch.Tensor):
-                #         inputs[in_] = data
-                #     else:
-                #         inputs[in_] = data[out_]
-            else:
-                raise ValueError(f"Can't find layer-{layer_id}'s predecessor from layer-{predecs_layer}.")
-        
-        return inputs[0] if len(inputs) == 1 else tuple(inputs)
-        
-    def sink_layer_output(self, outputs, layer_id):
-        self.layer_output_buffer[layer_id] = outputs
-        # for out_layer, succ_dict in self.module.output_buffers.items():
-        if layer_id in self.output_ref.keys():
-            for succ in sorted(self.output_ref[layer_id]):
-                if isinstance(outputs, torch.Tensor):
-                    self.get_layer_module(layer_id).output_buffers[succ][self.buffer_id] = outputs
+            if predecs_layer in self.input_ref[layer_id]:
+                # print(f"find pred {predecs_layer} in module {layer_id}'s layer_inputs, for buffer id {buffer_id}")
+                module_buffer = self.get_layer_module(layer_id).input_buffers[predecs_layer][buffer_id]   
+                if isinstance(module_buffer, torch.Tensor):
+                    out_, in_ = self.layer_inputs[layer_id][predecs_layer][0]
+                    # print(f"{in_}^th tensor out from {layer_id}'s layer_inputs")
+                    inputs[in_] = module_buffer
                 else:
-                    outputs_ = []
-                    for (out_, in_) in self.layer_outputs[layer_id][succ]:
-                        outputs_.append(outputs[out_])
-                    self.get_layer_module(layer_id).output_buffers[succ][self.buffer_id] = tuple(outputs_)
-
-    def set_curr_buffer_id(self, buffer_id):
-        """Must be invoked before each scheduled command.
-        """
-        self.buffer_id = buffer_id
-        for layer_id in self.hooked_layers:
-            layer_mod = self.get_layer_module(layer_id)
-            layer_mod.buffer_id = buffer_id
+                    assert isinstance(module_buffer, tuple)
+                    for (out_, in_) in self.layer_inputs[layer_id][predecs_layer]:
+                        # print(f"{in_}^th tensor out from {layer_id}'s layer_inputs")
+                        inputs[in_] = module_buffer[out_]
+                        
+        input_ready = [t is not None for t in inputs]
+        if not all(input_ready):
+            print(f"Layer {layer_id}'s input not satisfied: {input_ready}.")    
+            
+        return inputs[0] if isinstance(inputs, list) and len(inputs) == 1 else tuple(inputs)
         
+    def sink_layer_output(self, outputs, layer_id, buffer_id):
+        self.layer_output_buffer[layer_id][buffer_id] = outputs
+        
+    def form_layer_output_to_send(self, send_layer, recv_layer, buffer_id):
+        """ Generate a tensor tuple that need to be sent for `layer_id` layer."""
+        assert send_layer in self.output_ref.keys()
+        sender_buffer = self.layer_output_buffer[send_layer][buffer_id]
+        if isinstance(sender_buffer, torch.Tensor):
+            return sender_buffer
+        else:
+            send_tensors = []
+            for out_, in_ in self.layer_outputs[send_layer][recv_layer]:
+                send_tensors.append(self.layer_output_buffer[send_layer][buffer_id][out_])
+            return tuple(send_tensors)
+        
+    def naive_forward(self, start, end, buffer_id, graph_tail=False):
+        # for testing forward one-by-one
+        local_micro_offset = self.micro_offset + 1
+        start_func_idx = start - self._local_start
+        end_func_idx = end - self._local_start
+        for idx, layer in enumerate(self.forward_funcs[start_func_idx:end_func_idx]):
+            curr_layer = idx + start
+            # print(f"Rank {self.local_rank} exec layer {curr_layer}")
+            if self.seed_layers:
+                new_seed = (self.base_seed *
+                            local_micro_offset) + curr_layer
+                if self.seed_fn:
+                    self.seed_fn(new_seed)
+                else:
+                    ds_utils.set_random_seed(new_seed)
+            if idx == 0:
+                inputs = self.form_layer_input(curr_layer, buffer_id, check_graph_tail=graph_tail)
+            
+            outputs = layer(inputs)
+            inputs = outputs
+        return outputs
+        
+    def partial_forward(self, start, end, buffer_id, graph_tail=False):
+        local_micro_offset = self.micro_offset + 1
+        assert start >= self._local_start
+        start_func_idx = start - self._local_start
+        end_func_idx = end - self._local_start
+        for idx, layer in enumerate(self.forward_funcs[start_func_idx:end_func_idx]):
+            curr_layer = idx + start
+            # print(f"Rank {self.local_rank} exec layer {curr_layer}")
+            if self.seed_layers:
+                new_seed = (self.base_seed *
+                            local_micro_offset) + curr_layer
+                if self.seed_fn:
+                    self.seed_fn(new_seed)
+                else:
+                    ds_utils.set_random_seed(new_seed)
+
+            inputs = self.form_layer_input(curr_layer, buffer_id, check_graph_tail=True)
+            outputs = layer(inputs)
+            self.sink_layer_output(outputs, curr_layer, buffer_id)
+            # ds_utils.see_memory_usage(f"Rank={self.local_rank}, memory after exec layer {curr_layer}", True)
+        
+        # Leave a tail for feeding next graph
+        if graph_tail:
+            mod = self.get_layer_module(curr_layer)
+            if isinstance(outputs, torch.Tensor):
+                tail_outputs = outputs.clone().detach()
+                tail_outputs.requires_grad = tail_outputs.is_floating_point()
+            else:
+                tail_outputs = tuple([t.clone().detach() for t in outputs])
+                for t in tail_outputs:
+                    t.requires_grad = t.is_floating_point()
+            if not hasattr(mod, "tail_outputs"):
+                setattr(mod, "tail_outputs", {i: None for i in range(self.buffer_num)})
+            mod.tail_outputs[buffer_id] = tail_outputs
+            # print(f"Layer {curr_layer} breaks the graph with a tail. tail_outputs={mod.tail_outputs}")
+                
+        return outputs
+    
     def forward(self, forward_input):
-        # We need to offset the seed by the microbatch ID. Save it in a local var to
-        # ensure it is preserved in the closure. Otherwise checkpointed forward funcs
-        # will see a different offset.
+        # TODO: activation checkpointing feature to be impl.
         self.micro_offset += 1
 
-        def exec_range_func(start, end):
-            ''' Helper function to be used with checkpoint()
-            Adapted from torch.utils.checkpoint:checkpoint_sequential()
-            '''
-            local_micro_offset = self.micro_offset + 1
-            
-            def exec_func(inputs):
-                # Single tensor inputs need to be unwrapped
-                # if len(inputs) == 1:
-                #     inputs = inputs[0]
-                self.layer_output_buffer = dict()
-                for idx, layer in enumerate(self.forward_funcs[start:end]):
-                    self.curr_layer = idx + self._local_start
-                    if self.seed_layers:
-                        new_seed = (self.base_seed *
-                                    local_micro_offset) + self.curr_layer
-                        if self.seed_fn:
-                            self.seed_fn(new_seed)
-                        else:
-                            ds_utils.set_random_seed(new_seed)
-
-                    inputs = self.form_layer_input(self.curr_layer)
-                    outputs = layer(inputs)
-                    self.sink_layer_output(outputs, self.curr_layer)
-                return outputs
-
-            return exec_func
-
         if self.activation_checkpoint_interval == 0:
-            func = exec_range_func(0, len(self.forward_funcs))
-            x = func(forward_input)
+            pass
         else:
             raise ValueError("Activation checkpointing is not supported for now.")            
             num_layers = len(self.forward_funcs)

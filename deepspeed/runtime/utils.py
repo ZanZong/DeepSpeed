@@ -818,8 +818,8 @@ def get_ma_status():
 def see_memory_usage(message, force=False):
     if not force:
         return
-    if dist.is_initialized() and not dist.get_rank() == 0:
-        return
+    # if dist.is_initialized() and not dist.get_rank() == 0:
+    #     return
 
     # python doesn't do real-time garbage collection so do it explicitly to get the correct RAM reports
     gc.collect()
@@ -832,22 +832,41 @@ def see_memory_usage(message, force=False):
         CA {round(torch_memory_reserved() / (1024 * 1024 * 1024),2)} GB \
         Max_CA {round(torch_max_memory_reserved() / (1024 * 1024 * 1024))} GB ")
 
-    vm_stats = psutil.virtual_memory()
-    used_GB = round(((vm_stats.total - vm_stats.available) / (1024**3)), 2)
-    logger.info(
-        f'CPU Virtual Memory:  used = {used_GB} GB, percent = {vm_stats.percent}%')
+    # vm_stats = psutil.virtual_memory()
+    # used_GB = round(((vm_stats.total - vm_stats.available) / (1024**3)), 2)
+    # logger.info(
+    #     f'CPU Virtual Memory:  used = {used_GB} GB, percent = {vm_stats.percent}%')
 
     # get the peak memory to report correct data, so reset the counter for the next call
     if hasattr(torch.cuda, "reset_peak_memory_stats"):  # pytorch 1.4+
         torch.cuda.reset_peak_memory_stats()
+        
 
-
-# For logging info in multi-woker scenarios.
-log_base_path = "/home/zanzong/workspace/flexpipe/models/swin_transformer/logs/"
+log_base_path = None
+def init_timeline_logger(log_path):
+    global log_base_path
+    log_base_path = log_path
+    # clear logs for this run
+    if dist.get_rank() == 0:
+        import shutil
+        from datetime import datetime
+        for root, dirs, files in os.walk(log_base_path):
+            if len(files) != 0:
+                now = datetime.now()
+                dtime = now.strftime("%m-%d_%H-%M-%S")
+                backup_dir = f"{log_base_path}backup_{dtime}"
+                if os.path.exists(backup_dir):
+                    backup_dir = backup_dir + "_0"
+                os.mkdir(backup_dir)
+                for file in files:
+                    shutil.move(os.path.join(root, file), backup_dir)
+            break
+    
 def log_rank2file(info):
+    global log_base_path
     file_name = str(dist.get_rank()) + '.log'
     with open(log_base_path + file_name, 'a') as log:
-        log.writelines(str(info))
+        log.writelines(str(info) + '\n')
 
 def call_to_str(base, *args, **kwargs):
     """Construct a string representation of a call.
